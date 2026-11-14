@@ -222,10 +222,38 @@ index 72974fc..a13cee3 100644
  	polaris_gpu_unwind(&polaris_gpu, true);
  	printf("POLARIS GPU: acceleration unavailable; CPU display unchanged\n");
 diff --git a/bsd/dev/sweet_rpmh.c b/bsd/dev/sweet_rpmh.c
-index 4da50d8..7a455e2 100644
+index 4da50d8..3dec0e1 100644
 --- a/bsd/dev/sweet_rpmh.c
 +++ b/bsd/dev/sweet_rpmh.c
-@@ -324,6 +324,202 @@ rh_send(uint32_t address, unsigned mv)
+@@ -100,20 +100,27 @@ rh_range(uint32_t off, uint32_t size)
+ static int
+ rh_map(void)
+ {
++	printf("SWEET RPMH: map rsc=%#x tcs=%#x\n", RH_RSC_PA, RH_TCS_PA);
+ 	if (!rh_rsc) {
+ 		rh_rsc = ml_io_map(RH_RSC_PA, 0x100);
+ 	}
++	printf("SWEET RPMH: step rsc=%#x\n", (uint32_t)rh_rsc);
+ 	if (!rh_tcs) {
+ 		rh_tcs = ml_io_map(RH_TCS_PA, RH_TCS_SIZE);
+ 	}
++	printf("SWEET RPMH: step tcs=%#x\n", (uint32_t)rh_tcs);
+ 	if (!rh_dict) {
+ 		rh_dict = ml_io_map(RH_DICT_PA, 8);
+ 	}
++	printf("SWEET RPMH: step dict=%#x\n", (uint32_t)rh_dict);
+ 	if (!rh_rsc || !rh_tcs || !rh_dict) {
+ 		printf("SWEET RPMH: RSC/locator mapping failed\n");
+ 		return ENOMEM;
+ 	}
++	/* A gated RSC ACK-stalls the bus here, so announce the first read. */
++	printf("SWEET RPMH: reading rsc id\n");
+ 	uint32_t id = rh_read(rh_rsc, 0);
++	printf("SWEET RPMH: rsc id=%#x\n", id);
+ 	uint32_t solver = rh_read(rh_rsc, 4);
+ 	uint32_t config = rh_read(rh_rsc, 0x0c);
+ 	unsigned major = (id >> 16) & 0xffu;
+@@ -324,6 +331,207 @@ rh_send(uint32_t address, unsigned mv)
  	return 0;
  }
  
@@ -347,7 +375,8 @@ index 4da50d8..7a455e2 100644
 +	rh_write(rh_tcs, b + RH_CONTROL, RH_AMC_EN | RH_TRIGGER);
 +	uint32_t irq = 0, idle = 0, status = 0;
 +	bool done = false, progress = false;
-+	for (unsigned us = 0; us < RH_TIMEOUT_US; ++us) {
++	/* Bounded to ~200 ms: an ARC vote either retires at once or not at all. */
++	for (unsigned us = 0; us < 200; ++us) {
 +		irq = rh_read(rh_tcs, RH_IRQ_STATUS);
 +		idle = rh_read(rh_tcs, b + RH_STATUS);
 +		status = rh_read(rh_tcs, b + RH_CMD_STATUS);
@@ -410,12 +439,16 @@ index 4da50d8..7a455e2 100644
 +		printf("SWEET RPMH: previous uncertain transaction; refusing ARC vote\n");
 +		goto out;
 +	}
++	printf("SWEET RPMH: arc vote begin %s=%u\n", res, level);
 +	error = rh_map();
++	printf("SWEET RPMH: arc map err=%d\n", error);
 +	if (!error) {
 +		error = rh_lookup_arc(res, &address);
++		printf("SWEET RPMH: arc lookup addr=%#x err=%d\n", address, error);
 +	}
 +	if (!error) {
 +		error = rh_send_one(address, level);
++		printf("SWEET RPMH: arc send err=%d\n", error);
 +	}
 +out:
 +	if (error) {
