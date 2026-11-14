@@ -1,0 +1,420 @@
+diff --git a/bsd/dev/polaris_gpu.c b/bsd/dev/polaris_gpu.c
+index 72974fc..12ae043 100644
+--- a/bsd/dev/polaris_gpu.c
++++ b/bsd/dev/polaris_gpu.c
+@@ -7,8 +7,51 @@
+ #include <sys/param.h>
+ #include <sys/systm.h>
+ #include <pexpert/pexpert.h>
++#include <kern/clock.h>
++#include <machine/machine_routines.h>
+ 
+ extern bool polaris_touch_i2c_board(void);
++extern int sweet_rpmh_arc_level(const char *res, unsigned level);
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++
++/*
++ * GPUCC/GFXCC live in one shared 0x05090000..0x05098fff window; the GPU core
++ * registers below it start at 0x05000000. The board contract pins the two
++ * power domains at +0x106c (CX) and +0x100c (GX). CX is ours to switch on
++ * before any clock work. GX is *not*: KGSL asks the GMU for it, and flipping
++ * that switch by hand is what the contract forbids.
++ */
++#define POLARIS_GPU_REGS_PA     0x05000000UL
++#define POLARIS_GPU_REGS_SIZE   0x100000UL
++#define POLARIS_GPU_CHIPID      0x00000u
++#define POLARIS_GPU_CX_GDSCR    0x9106cu
++#define POLARIS_GPU_GX_GDSCR    0x9100cu
++#define POLARIS_GPU_GDSC_PWR_ON (1u << 31)
++#define POLARIS_GPU_GDSC_COLLAPSE 1u
++
++/* RBBM id for A630v2 as reported by the vendor kernel: 0x06030001. */
++#define POLARIS_A630V2_CHIPID   0x06030001u
++
++/* Lowest non-zero corner. RPMh aggregates by max, so this cannot lower a rail. */
++#define POLARIS_GPU_ARC_LEVEL   1u
++
++#define POLARIS_GPU_OWN_CX      (1u << 0)
++
++static vm_offset_t polaris_gpu_regs;
++
++static inline uint32_t
++polaris_gpu_rd(uint32_t off)
++{
++	return *(volatile uint32_t *)(polaris_gpu_regs + off);
++}
++
++static inline void
++polaris_gpu_wr(uint32_t off, uint32_t value)
++{
++	*(volatile uint32_t *)(polaris_gpu_regs + off) = value;
++	__asm__ volatile("dsb sy" ::: "memory");
++}
++
+ 
+ enum polaris_gpu_stage {
+ 	POLARIS_GPU_BOARD,
+@@ -37,19 +80,88 @@ struct polaris_gpu_context {
+ 	enum polaris_gpu_state state;
+ 	unsigned int completed;
+ 	unsigned int owned;
++	uint32_t cx_gdscr_saved;
+ };
+ 
+-static struct polaris_gpu_context polaris_gpu = { POLARIS_GPU_OFF, 0, 0 };
++static struct polaris_gpu_context polaris_gpu = { POLARIS_GPU_OFF, 0, 0, 0 };
+ 
+ static const char *const polaris_gpu_stage_name[POLARIS_GPU_STAGE_COUNT] = {
+ 	"board", "firmware", "rails", "clocks", "bus", "GMU",
+ 	"HFI", "SMMU", "PAS13", "CP", "fence"
+ };
+ 
++/*
++ * Rails backend. Everything here is bounded and reversible:
++ *
++ *  - ARC votes are low and RPMh takes the maximum across owners, so they can
++ *    never pull a corner below what somebody else already holds.
++ *  - Only the CX domain is switched on, and only if it was off; the previous
++ *    register value is kept so unwind() can put it back.
++ *  - GX is left alone on purpose. The contract is explicit that GX goes
++ *    through the GMU, so this stage stops at the wrapper.
++ *
++ * The chip id read is a free observation, not a success condition: with GX
++ * still collapsed the core cannot answer, and a zero read tells us exactly
++ * that rather than proving anything wrong.
++ */
++static bool
++polaris_gpu_rails_backend(struct polaris_gpu_context *ctx)
++{
++	static const char *const corners[] = { "cx.lvl", "mx.lvl", "gfx.lvl" };
++
++	if (!polaris_gpu_regs) {
++		polaris_gpu_regs = ml_io_map(POLARIS_GPU_REGS_PA, POLARIS_GPU_REGS_SIZE);
++		if (!polaris_gpu_regs) {
++			printf("POLARIS GPU: rails: GPUCC mapping failed\n");
++			return false;
++		}
++	}
++
++	uint32_t cx = polaris_gpu_rd(POLARIS_GPU_CX_GDSCR);
++	uint32_t gx = polaris_gpu_rd(POLARIS_GPU_GX_GDSCR);
++	printf("POLARIS GPU: rails: cx-gdscr=%#x gx-gdscr=%#x chip-id=%#x\n",
++	    cx, gx, polaris_gpu_rd(POLARIS_GPU_CHIPID));
++
++	for (unsigned i = 0; i < sizeof(corners) / sizeof(corners[0]); ++i) {
++		int error = sweet_rpmh_arc_level(corners[i], POLARIS_GPU_ARC_LEVEL);
++		printf("POLARIS GPU: rails: %s=%u -> %d\n", corners[i],
++		    POLARIS_GPU_ARC_LEVEL, error);
++		if (error) {
++			/* A refused vote means the RSC is unusable for us this boot. */
++			return false;
++		}
++	}
++
++	if (cx & POLARIS_GPU_GDSC_PWR_ON) {
++		printf("POLARIS GPU: rails: CX already powered, not claimed\n");
++	} else {
++		ctx->cx_gdscr_saved = cx;
++		ctx->owned |= POLARIS_GPU_OWN_CX;
++		polaris_gpu_wr(POLARIS_GPU_CX_GDSCR, cx & ~POLARIS_GPU_GDSC_COLLAPSE);
++		for (unsigned i = 0; i < 100; ++i) {
++			cx = polaris_gpu_rd(POLARIS_GPU_CX_GDSCR);
++			if (cx & POLARIS_GPU_GDSC_PWR_ON) {
++				break;
++			}
++			delay(1);
++		}
++		printf("POLARIS GPU: rails: CX power-on -> %#x (%s)\n", cx,
++		    (cx & POLARIS_GPU_GDSC_PWR_ON) ? "up" : "still collapsed");
++		if (!(cx & POLARIS_GPU_GDSC_PWR_ON)) {
++			polaris_gpu_wr(POLARIS_GPU_CX_GDSCR, ctx->cx_gdscr_saved);
++			ctx->owned &= ~POLARIS_GPU_OWN_CX;
++			return false;
++		}
++	}
++
++	printf("POLARIS GPU: rails: chip-id now %#x (A630v2 expects %#x)\n",
++	    polaris_gpu_rd(POLARIS_GPU_CHIPID), POLARIS_A630V2_CHIPID);
++	return true;
++}
++
+ /*
+  * Only an acquired resource may be released. Resource-specific release
+  * callbacks must be installed before ANY power or mapping code is enabled.
+- * No stages after the board stage have a backend in this revision.
+  */
+ static bool
+ polaris_gpu_enter(struct polaris_gpu_context *ctx, enum polaris_gpu_stage stage)
+@@ -59,18 +171,25 @@ polaris_gpu_enter(struct polaris_gpu_context *ctx, enum polaris_gpu_stage stage)
+ 	    stage >= POLARIS_GPU_STAGE_COUNT) {
+ 		return false;
+ 	}
+-	if (stage != POLARIS_GPU_BOARD) {
+-		printf("POLARIS GPU: %s backend not implemented; no hardware access\n",
+-		    polaris_gpu_stage_name[stage]);
+-		return false;
++	if (stage == POLARIS_GPU_BOARD) {
++		/* Board identity is checked again here, not only at the caller. */
++		if (!polaris_touch_i2c_board()) {
++			return false;
++		}
++		ctx->completed++;
++		/* The board predicate acquires nothing; owned remains zero. */
++		return true;
+ 	}
+-	/* Board identity is checked again here, not only at the caller. */
+-	if (!polaris_touch_i2c_board()) {
+-		return false;
++	if (stage == POLARIS_GPU_RAILS) {
++		if (!polaris_gpu_rails_backend(ctx)) {
++			return false;
++		}
++		ctx->completed++;
++		return true;
+ 	}
+-	ctx->completed++;
+-	/* The board predicate acquires nothing; owned remains zero. */
+-	return true;
++	printf("POLARIS GPU: %s backend not implemented; no hardware access\n",
++	    polaris_gpu_stage_name[stage]);
++	return false;
+ }
+ 
+ static void
+@@ -82,7 +201,13 @@ polaris_gpu_unwind(struct polaris_gpu_context *ctx, bool idle_confirmed)
+ 		printf("POLARIS GPU: idle unconfirmed; quarantined, CPU display unchanged\n");
+ 		return;
+ 	}
+-	/* No hardware release is permitted while no backend owns a resource. */
++	/* Release exactly what this boot switched on, newest first. */
++	if (ctx->owned & POLARIS_GPU_OWN_CX) {
++		polaris_gpu_wr(POLARIS_GPU_CX_GDSCR, ctx->cx_gdscr_saved);
++		printf("POLARIS GPU: rails: CX restored to %#x\n", ctx->cx_gdscr_saved);
++		ctx->owned &= ~POLARIS_GPU_OWN_CX;
++	}
++	/* No hardware release is permitted while any owner lacks a backend. */
+ 	if (ctx->owned != 0) {
+ 		ctx->state = POLARIS_GPU_QUARANTINED;
+ 		printf("POLARIS GPU: owned resource lacks release backend; quarantined\n");
+@@ -110,9 +235,11 @@ polaris_gpu_init(void)
+ 	if (!polaris_gpu_enter(&polaris_gpu, POLARIS_GPU_FIRMWARE)) {
+ 		goto fail;
+ 	}
+-	/* Unreachable until individually owned, bounded backends are installed. */
+-	polaris_gpu.state = POLARIS_GPU_IDLE;
+-	return;
++	if (!polaris_gpu_enter(&polaris_gpu, POLARIS_GPU_RAILS)) {
++		goto fail;
++	}
++	/* Clocks are the next backend; until it exists the rails are handed back. */
++	printf("POLARIS GPU: rails verified; no clock backend, handing back\n");
+ fail:
+ 	polaris_gpu_unwind(&polaris_gpu, true);
+ 	printf("POLARIS GPU: acceleration unavailable; CPU display unchanged\n");
+diff --git a/bsd/dev/sweet_rpmh.c b/bsd/dev/sweet_rpmh.c
+index 4da50d8..7a455e2 100644
+--- a/bsd/dev/sweet_rpmh.c
++++ b/bsd/dev/sweet_rpmh.c
+@@ -324,6 +324,202 @@ rh_send(uint32_t address, unsigned mv)
+ 	return 0;
+ }
+ 
++/*
++ * ARC (level) votes.
++ *
++ * The L11C path above is a PMIC5 LDO: three commands (voltage, mode, enable)
++ * on RSC slave 4, with the resource type encoded as 4 in the address. An ARC
++ * corner is a different animal -- one command, one word, slave 3, type 3.
++ * rpmh-regulator calls that word the level, 0..15; RPMh aggregates every
++ * client by maximum, so a low vote can never pull a rail below what another
++ * owner already requested.
++ */
++#define RH_ARC          3u
++#define RH_ARC_MAX      16u
++
++static int
++rh_lookup_arc(const char *res, uint32_t *address)
++{
++	uint32_t key[2] = {0, 0};
++
++	for (unsigned i = 0; i < 8 && res[i]; ++i) {
++		key[i / 4] |= (uint32_t)(uint8_t)res[i] << (8u * (i % 4));
++	}
++	unsigned matches = 0;
++	for (unsigned i = 0; i < 8; ++i) {
++		uint32_t h = 8u + 16u * i;
++		unsigned slave = rh_db16(h);
++		if (!slave) {
++			break;
++		}
++		uint32_t entries = RH_DB_HEADER + rh_db16(h + 2);
++		uint32_t aux = RH_DB_HEADER + rh_db16(h + 4);
++		unsigned count = rh_db16(h + 6);
++		if (slave < 3 || slave > 5 || (entries & 3u) ||
++		    !rh_range(entries, count * RH_DB_ENTRY) || !rh_range(aux, 0)) {
++			printf("SWEET RPMH: malformed cmd-db slave header %u\n", i);
++			return EINVAL;
++		}
++		if (slave != RH_ARC) {
++			continue;
++		}
++		for (unsigned j = 0; j < count; ++j) {
++			uint32_t e = entries + RH_DB_ENTRY * j;
++			if (rh_read(rh_db, e) != key[0] || rh_read(rh_db, e + 4) != key[1]) {
++				continue;
++			}
++			uint32_t addr = rh_read(rh_db, e + 16);
++			if ((addr >> 16) != RH_ARC || (addr & 15u)) {
++				printf("SWEET RPMH: invalid ARC entry for %s\n", res);
++				return EINVAL;
++			}
++			*address = addr;
++			++matches;
++			printf("SWEET RPMH: %s arc addr=%#x slave=%u\n", res, addr, slave);
++		}
++	}
++	if (matches != 1) {
++		printf("SWEET RPMH: %s arc lookup matches=%u; refusing\n", res, matches);
++		return ENODEV;
++	}
++	return 0;
++}
++
++/*
++ * Single-command TCS transaction. Same handshake as rh_send(), but WAIT and
++ * ENABLE select command 0 only. WAIT=0 would tell the RSC to wait for nothing
++ * and the slot would never retire.
++ */
++static int
++rh_send_one(uint32_t address, uint32_t data)
++{
++	int chosen = -1;
++
++	for (unsigned t = 0; t < RH_ACTIVE_N; ++t) {
++		uint32_t b = t * RH_TCS_STRIDE;
++		uint32_t enabled = rh_read(rh_tcs, b + RH_ENABLE);
++		printf("SWEET RPMH: ARC TCS%u idle=%#x control=%#x enable=%#x wait=%#x\n",
++		    t, rh_read(rh_tcs, b + RH_STATUS), rh_read(rh_tcs, b + RH_CONTROL),
++		    enabled, rh_read(rh_tcs, b + RH_WAIT));
++		if (enabled & ~((1u << rh_ncpt) - 1u)) {
++			return EIO;
++		}
++		if (chosen < 0 && rh_free(t)) {
++			chosen = (int)t;
++		}
++	}
++	if (chosen < 0) {
++		printf("SWEET RPMH: no empty idle ACTIVE TCS for the ARC vote\n");
++		return EBUSY;
++	}
++	unsigned t = (unsigned)chosen;
++	uint32_t b = t * RH_TCS_STRIDE, bit = 1u << t;
++	uint32_t irq_en = rh_read(rh_tcs, RH_IRQ_EN);
++	if (irq_en == 0xffffffffu || !rh_free(t)) {
++		return EBUSY;
++	}
++	if (!rh_sync(RH_IRQ_EN, irq_en & ~bit)) {
++		rh_poisoned = true;
++		return EIO;
++	}
++	if (!rh_free(t)) {
++		if (!rh_sync(RH_IRQ_EN, (rh_read(rh_tcs, RH_IRQ_EN) & ~bit) | (irq_en & bit))) {
++			rh_poisoned = true;
++		}
++		return EBUSY;
++	}
++	rh_poisoned = true;
++	uint32_t cmd = b;
++	if (!rh_sync(cmd + RH_MSGID, RH_WRITE_ACK) ||
++	    !rh_sync(cmd + RH_ADDR, address) ||
++	    !rh_sync(cmd + RH_DATA, data)) {
++		return EIO;
++	}
++	if (!rh_sync(b + RH_WAIT, 1) || !rh_sync(b + RH_ENABLE, 1) ||
++	    !rh_sync(b + RH_CONTROL, 0) || !rh_sync(b + RH_CONTROL, RH_AMC_EN)) {
++		return EIO;
++	}
++	rh_write(rh_tcs, b + RH_CONTROL, RH_AMC_EN | RH_TRIGGER);
++	uint32_t irq = 0, idle = 0, status = 0;
++	bool done = false, progress = false;
++	for (unsigned us = 0; us < RH_TIMEOUT_US; ++us) {
++		irq = rh_read(rh_tcs, RH_IRQ_STATUS);
++		idle = rh_read(rh_tcs, b + RH_STATUS);
++		status = rh_read(rh_tcs, b + RH_CMD_STATUS);
++		bool complete = status != 0xffffffffu &&
++		    (status & (RH_ISSUED | RH_COMPLETE)) == (RH_ISSUED | RH_COMPLETE);
++		progress |= idle == 0 || !complete;
++		if (idle && idle != 0xffffffffu && irq != 0xffffffffu &&
++		    ((irq & bit) || progress) && complete) {
++			done = true;
++			break;
++		}
++		delay(1);
++	}
++	printf("SWEET RPMH: ARC TCS%u done=%d irq=%#x idle=%#x cmd-status=%#x\n",
++	    t, done, irq, idle, status);
++	if (!done) {
++		printf("SWEET RPMH: ARC vote timeout; TCS quarantined, no retry\n");
++		return ETIMEDOUT;
++	}
++	if (!rh_sync(b + RH_CONTROL, RH_AMC_EN) || !rh_sync(b + RH_CONTROL, 0) ||
++	    !rh_sync(b + RH_ENABLE, 0) || !rh_sync(b + RH_WAIT, 0)) {
++		return EIO;
++	}
++	rh_write(rh_tcs, RH_IRQ_CLEAR, bit);
++	if ((rh_read(rh_tcs, RH_IRQ_STATUS) & bit) ||
++	    !rh_sync(RH_IRQ_EN, (rh_read(rh_tcs, RH_IRQ_EN) & ~bit) | (irq_en & bit))) {
++		return EIO;
++	}
++	rh_poisoned = false;
++	return 0;
++}
++
++int
++sweet_rpmh_arc_level(const char *res, unsigned level)
++{
++	static const char *const known[] = {
++		"gfx.lvl", "cx.lvl", "mx.lvl", "ebi.lvl"
++	};
++	bool allowed = false;
++
++	if (!res || level >= RH_ARC_MAX) {
++		printf("SWEET RPMH: ARC level must be 0..%u\n", RH_ARC_MAX - 1u);
++		return EINVAL;
++	}
++	for (unsigned i = 0; i < sizeof(known) / sizeof(known[0]); ++i) {
++		if (!strcmp(res, known[i])) {
++			allowed = true;
++		}
++	}
++	if (!allowed) {
++		printf("SWEET RPMH: %s is not a known ARC resource\n", res);
++		return EINVAL;
++	}
++	if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) {
++		return EBUSY;
++	}
++	int error = EIO;
++	uint32_t address = 0;
++	if (rh_poisoned) {
++		printf("SWEET RPMH: previous uncertain transaction; refusing ARC vote\n");
++		goto out;
++	}
++	error = rh_map();
++	if (!error) {
++		error = rh_lookup_arc(res, &address);
++	}
++	if (!error) {
++		error = rh_send_one(address, level);
++	}
++out:
++	if (error) {
++		printf("SWEET RPMH: ARC vote %s=%u failed errno=%d\n", res, level, error);
++	}
++	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
++	return error;
++}
++
+ int
+ sweet_rpmh_vreg_enable(const char *res, unsigned mv)
+ {
