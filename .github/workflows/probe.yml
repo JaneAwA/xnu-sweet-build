@@ -1,0 +1,29 @@
+name: probe
+
+on:
+  workflow_dispatch:
+
+jobs:
+  probe:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [macos-13, macos-14, macos-15]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 10
+    continue-on-error: true
+    steps:
+      - name: Report runner and toolchain
+        run: |
+          echo "label     : ${{ matrix.runner }}"
+          uname -m
+          sw_vers
+          echo "--- Xcode images ---"
+          ls -d /Applications/Xcode*.app 2>/dev/null || echo "(none)"
+          echo "--- selected ---"
+          xcode-select -p
+          xcodebuild -version || true
+          echo "--- iig ---"
+          xcrun --find iig || true
+          echo "--- KDK ---"
+          ls /Library/Developer/KDKs 2>/dev/null || echo "(no KDK)"
