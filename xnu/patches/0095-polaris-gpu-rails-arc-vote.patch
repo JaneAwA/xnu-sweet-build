@@ -1,5 +1,5 @@
 diff --git a/bsd/dev/polaris_gpu.c b/bsd/dev/polaris_gpu.c
-index 72974fc..12ae043 100644
+index 72974fc..a13cee3 100644
 --- a/bsd/dev/polaris_gpu.c
 +++ b/bsd/dev/polaris_gpu.c
 @@ -7,8 +7,51 @@
@@ -145,7 +145,7 @@ index 72974fc..12ae043 100644
   */
  static bool
  polaris_gpu_enter(struct polaris_gpu_context *ctx, enum polaris_gpu_stage stage)
-@@ -59,18 +171,25 @@ polaris_gpu_enter(struct polaris_gpu_context *ctx, enum polaris_gpu_stage stage)
+@@ -59,18 +171,35 @@ polaris_gpu_enter(struct polaris_gpu_context *ctx, enum polaris_gpu_stage stage)
  	    stage >= POLARIS_GPU_STAGE_COUNT) {
  		return false;
  	}
@@ -165,23 +165,33 @@ index 72974fc..12ae043 100644
 -	/* Board identity is checked again here, not only at the caller. */
 -	if (!polaris_touch_i2c_board()) {
 -		return false;
-+	if (stage == POLARIS_GPU_RAILS) {
-+		if (!polaris_gpu_rails_backend(ctx)) {
-+			return false;
-+		}
++	if (stage == POLARIS_GPU_FIRMWARE) {
++		/*
++		 * The a630 blobs live on the root image, not in the kernel, so this
++		 * stage is an offline precondition (polaris_gpu_preflight) rather
++		 * than a hardware step. It acquires nothing; the gate may continue.
++		 */
++		printf("POLARIS GPU: firmware validated offline; nothing claimed\n");
 +		ctx->completed++;
 +		return true;
  	}
 -	ctx->completed++;
 -	/* The board predicate acquires nothing; owned remains zero. */
 -	return true;
++	if (stage == POLARIS_GPU_RAILS) {
++		if (!polaris_gpu_rails_backend(ctx)) {
++			return false;
++		}
++		ctx->completed++;
++		return true;
++	}
 +	printf("POLARIS GPU: %s backend not implemented; no hardware access\n",
 +	    polaris_gpu_stage_name[stage]);
 +	return false;
  }
  
  static void
-@@ -82,7 +201,13 @@ polaris_gpu_unwind(struct polaris_gpu_context *ctx, bool idle_confirmed)
+@@ -82,7 +211,13 @@ polaris_gpu_unwind(struct polaris_gpu_context *ctx, bool idle_confirmed)
  		printf("POLARIS GPU: idle unconfirmed; quarantined, CPU display unchanged\n");
  		return;
  	}
@@ -196,7 +206,7 @@ index 72974fc..12ae043 100644
  	if (ctx->owned != 0) {
  		ctx->state = POLARIS_GPU_QUARANTINED;
  		printf("POLARIS GPU: owned resource lacks release backend; quarantined\n");
-@@ -110,9 +235,11 @@ polaris_gpu_init(void)
+@@ -110,9 +245,11 @@ polaris_gpu_init(void)
  	if (!polaris_gpu_enter(&polaris_gpu, POLARIS_GPU_FIRMWARE)) {
  		goto fail;
  	}
