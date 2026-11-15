@@ -1,0 +1,85 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index bf6b9fa..9cde72c 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -80,6 +80,15 @@ enum {
+  */
+ #define SWEET_FB_LOGICAL_W              1125
+ #define SWEET_FB_LOGICAL_H              2436
++/*
++ * Polaris panel is 1080x2160, exactly 1:2. Reporting a logical display with
++ * the same aspect lets the whole frame scale uniformly onto the panel: no
++ * side bars, no cropping, no distortion. 1125x2250 is 375x750 points at 3x,
++ * and the width still matches the iPhone X family that UIKit keys its status
++ * bar provider on.
++ */
++#define SWEET_FB_POLARIS_W              1125
++#define SWEET_FB_POLARIS_H              2250
+ #define SWEET_FB_FORMAT_BGRA            0x42475241
+ 
+ class IOMobileFramebuffer : public IOService {
+@@ -177,22 +186,27 @@ AppleCLCD::start(IOService *provider)
+ 	fContentW = fWidth;
+ 	fContentH = fHeight;
+ 	fScale = 0;
+-	if (!native && fWidth <= SWEET_FB_LOGICAL_W && fHeight <= SWEET_FB_LOGICAL_H) {
+-		fLogicalW = SWEET_FB_LOGICAL_W;
+-		fLogicalH = SWEET_FB_LOGICAL_H;
+-	}
+ 	if (!native && polaris) {
+ 		/*
+-		 * Polaris is 1080x2160 (18:9). Fit the whole iPhone X logical
+-		 * display by height (998x2160) instead of cropping it, with
+-		 * black 41-pixel bars on the sides.
++		 * Same aspect as the panel, so the scale is uniform and the frame
++		 * fills 1080x2160. Both sizes can be overridden from the command
++		 * line to try another logical geometry without a rebuild.
+ 		 */
+-		fContentW = (fLogicalW * fHeight + fLogicalH / 2) / fLogicalH;
++		int lw = 0, lh = 0;
++		PE_parse_boot_argn("sweetfb_logical_w", &lw, sizeof(lw));
++		PE_parse_boot_argn("sweetfb_logical_h", &lh, sizeof(lh));
++		fLogicalW = (lw > 0) ? (uint32_t)lw : SWEET_FB_POLARIS_W;
++		fLogicalH = (lh > 0) ? (uint32_t)lh : SWEET_FB_POLARIS_H;
++		fContentW = fWidth;
+ 		fContentH = fHeight;
+-		fOffX = (int32_t)(fWidth - fContentW) / 2;
++		fOffX = 0;
+ 		fOffY = 0;
+ 		fScale = 1;
+ 	} else {
++		if (!native && fWidth <= SWEET_FB_LOGICAL_W && fHeight <= SWEET_FB_LOGICAL_H) {
++			fLogicalW = SWEET_FB_LOGICAL_W;
++			fLogicalH = SWEET_FB_LOGICAL_H;
++		}
+ 		fOffX = (int32_t)(fLogicalW - fWidth) / 2;
+ 		fOffY = (int32_t)(fLogicalH - fHeight) / 2;
+ 	}
+diff --git a/iokit/Kernel/arm/hid/SweetHID.cpp b/iokit/Kernel/arm/hid/SweetHID.cpp
+index 6aed214..ba6f922 100644
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -443,11 +443,20 @@ SweetHIDTouch::start(IOService *provider)
+ 	fPanelH = 2400;
+ 	fScale = 0;
+ 	if (!native && polaris) {
+-		/* Polaris 1080x2160: the logical display is scaled by height. */
++		/*
++		 * Must mirror AppleCLCD: same logical size, same content area, or
++		 * touch lands somewhere other than where the finger is. The two
++		 * boot args let both sides be retuned from the command line.
++		 */
++		int lw = 0, lh = 0;
++		PE_parse_boot_argn("sweetfb_logical_w", &lw, sizeof(lw));
++		PE_parse_boot_argn("sweetfb_logical_h", &lh, sizeof(lh));
++		fLogicalW = (lw > 0) ? lw : 1125;
++		fLogicalH = (lh > 0) ? lh : 2250;
+ 		fPanelH = 2160;
+-		fContentW = (fLogicalW * fPanelH + fLogicalH / 2) / fLogicalH;
++		fContentW = fPanelW;
+ 		fContentH = fPanelH;
+-		fOffX = (fPanelW - fContentW) / 2;
++		fOffX = 0;
+ 		fOffY = 0;
+ 		fScale = 1;
+ 	} else {
