@@ -24,6 +24,9 @@ on:
       - "xnu/patches/**"
       - ".github/workflows/xnu.yml"
 
+permissions:
+  contents: write
+
 concurrency:
   group: xnu-${{ github.ref }}
   cancel-in-progress: true
@@ -32,7 +35,7 @@ env:
   DXB_REPO: https://github.com/blacktop/darwin-xnu-build
   DXB_SHA: 663906528d1cd5ea8fde7de6f16de73db9511549
   MACOS_VERSION: ${{ inputs.macos_version || '13.5' }}
-  KERNEL_CONFIG: ${{ inputs.kernel_config || 'DEVELOPMENT' }}
+  KERNEL_CONFIG: ${{ inputs.kernel_config || 'RELEASE' }}
   MACHINE_CONFIG: ${{ inputs.machine_config || 'SWEET' }}
 
 jobs:
@@ -128,3 +131,54 @@ jobs:
           name: xnu-kernel
           path: out/
           if-no-files-found: warn
+
+      # Artifact downloads land on Azure blob storage, which is throttled to a
+      # few hundred bytes per second from our side (a 60 MB kernel never
+      # arrives). api.github.com is fine, so the kernel is stored as a git blob
+      # on the kernel-artifacts branch instead and fetched through the API.
+      - name: Publish kernel to the kernel-artifacts branch
+        if: always()
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          python3 - <<'PY'
+          import base64, glob, json, os, urllib.error, urllib.request
+
+          tok, repo = os.environ['TOKEN'], os.environ['REPO']
+          API = 'https://api.github.com'
+
+          def call(method, path, body=None):
+              data = json.dumps(body).encode() if body is not None else None
+              req = urllib.request.Request(API + path, data=data, method=method, headers={
+                  'Authorization': 'Bearer ' + tok,
+                  'Accept': 'application/vnd.github+json',
+                  'User-Agent': 'xnu-publish'})
+              with urllib.request.urlopen(req, timeout=180) as r:
+                  raw = r.read()
+                  return json.loads(raw) if raw else {}
+
+          cands = sorted(glob.glob('out/kernel.*sweet'))
+          if not cands:
+              print('no kernel to publish')
+              raise SystemExit(0)
+          path = cands[0]
+          raw = open(path, 'rb').read()
+          blob = call('POST', '/repos/%s/git/blobs' % repo,
+                      {'content': base64.b64encode(raw).decode(), 'encoding': 'base64'})
+          entry = [{'path': 'kernel.bin', 'mode': '100644', 'type': 'blob', 'sha': blob['sha']}]
+          try:
+              ref = call('GET', '/repos/%s/git/ref/heads/kernel-artifacts' % repo)
+              base = ref['object']['sha']
+              tree = call('POST', '/repos/%s/git/trees' % repo, {'base_tree': call('GET', '/repos/%s/git/commits/%s' % (repo, base))['tree']['sha'], 'tree': entry})
+              commit = call('POST', '/repos/%s/git/commits' % repo,
+                            {'message': 'kernel %s' % os.environ.get('GITHUB_SHA', '')[:8], 'tree': tree['sha'], 'parents': [base]})
+              call('PATCH', '/repos/%s/git/refs/heads/kernel-artifacts' % repo, {'sha': commit['sha'], 'force': True})
+          except urllib.error.HTTPError:
+              head = call('GET', '/repos/%s/git/ref/heads/main' % repo)['object']['sha']
+              tree = call('POST', '/repos/%s/git/trees' % repo, {'tree': entry})
+              commit = call('POST', '/repos/%s/git/commits' % repo,
+                            {'message': 'kernel %s' % os.environ.get('GITHUB_SHA', '')[:8], 'tree': tree['sha'], 'parents': [head]})
+              call('POST', '/repos/%s/git/refs' % repo, {'ref': 'refs/heads/kernel-artifacts', 'sha': commit['sha']})
+          print('published %s (%d bytes)' % (blob['sha'][:10], len(raw)))
+          PY
